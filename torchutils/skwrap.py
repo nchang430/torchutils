@@ -2,6 +2,7 @@ from functools import wraps
 import multiprocessing as mp
 
 import numpy as np
+import uuid
 from sklearn.base import BaseEstimator
 from sklearn.metrics import accuracy_score, make_scorer
 from sklearn.model_selection import cross_validate, GridSearchCV
@@ -21,6 +22,30 @@ class _ArrayDataset(Dataset):
 
     def __len__(self):
         return self.arrays[0].shape[0]
+
+
+class LogGridSearchCV(GridSearchCV):
+    def fit(self, X, y=None, groups=None, **fit_params):
+        self.refit = False
+        super().fit(X, y, groups, **fit_params)
+        results = self.cv_results_
+        refit_metric = "score"
+
+        self.best_index_ = results["rank_test_%s" % refit_metric].argmin()
+        self.best_params_ = results["params"][self.best_index_]
+        self.best_score_ = results["mean_test_%s" % refit_metric][self.best_index_]
+
+        self.best_estimator_ = clone(self.estimator).set_params(**self.best_params_)
+        refit_start_time = time.time()
+        if y is not None:
+            self.best_estimator_.fit(X, y, log=True, **fit_params)
+        else:
+            self.best_estimator_.fit(X, log=True, **fit_params)
+        refit_end_time = time.time()
+        self.refit_time_ = refit_end_time - refit_start_time
+        self.refit = True
+
+        return self
 
 
 class TorchDeviceManager:
@@ -75,6 +100,7 @@ class TorchEstimator(BaseEstimator):
     def __init__(
         self,
         model_cls,
+        key_model_args=None,
         model_args=None,
         loss_fun=F.mse_loss,
         optim_cls=optim.Adam,
@@ -87,9 +113,12 @@ class TorchEstimator(BaseEstimator):
         train_shuffle=True,
         train_drop_last_batch=False,
         test_batch_size=None,
+        tb_dir=None,
+        model_path=None,
     ):
         self.model = None
         self.model_cls = model_cls
+        self.key_model_args = key_model_args
         self.model_args = model_args
         self.loss_fun = loss_fun
         self.optim_cls = optim_cls
@@ -103,8 +132,33 @@ class TorchEstimator(BaseEstimator):
         self.train_drop_last_batch = train_drop_last_batch
         self.test_batch_size = test_batch_size or train_batch_size
         self.device = None
+        self.tb_dir = tb_dir
+        self.model_path = model_path
+        if not hasattr(self, "model_id"):
+            self.model_id = str(uuid.uuid4())[:13]
 
-    def fit(self, X, y):
+    def fit(self, X, y, log=False):
+        self.device = TorchDeviceManager.acquire_device()
+        print(f"training {self} on {self.device}")
+        # log final model training tb and tb setup
+        tb_writer = None
+        if log:
+            print(f"training {self} on {self.device}")
+            try:
+                tb_dir = path.Path(self.tb_dir) / self.model_id
+                tb_dir.mkdir()
+                tb_writer = SummaryWriter(str(tb_dir), purge_step=0, max_queue=0)
+                log.debug(f"Tensorboard writer initialized for {self.tb_dir}")
+                repo = git.Repo(search_parent_directories=True)
+                sha = repo.head.object.hexsha
+                with open(str(tb_dir) + f"/{self.model_id}_args.txt", "w") as f:
+                    f.write(f"Git Commit: {sha}\n\nModel Parameters:\n")
+                    for k, v in self.__dict__.items():
+                        f.write(f"\t{str(k)}: {str(v)}\n")
+            except OSError as e:
+                log.critical(f"Cannot access tensorboard directory: {e}")
+                sys.exit(1)
+
         if self.model_args is None:
             self.model_args = dict()
         if self.optim_args is None:
@@ -112,13 +166,10 @@ class TorchEstimator(BaseEstimator):
         if self.lr_sched_args is None:
             self.lr_sched_args = dict()
 
-        self.device = TorchDeviceManager.acquire_device()
-        print(f"training {self} on {self.device}")
-
-        self.model = self.model_cls(**self.model_args).to(self.device)
-        optzr = self.optim_cls(
-            self.model.parameters(), self.lr, **self.optim_args
+        self.model = self.model_cls(**self.key_model_args, **self.model_args).to(
+            self.device
         )
+        optzr = self.optim_cls(self.model.parameters(), self.lr, **self.optim_args)
         if self.lr_sched_cls is not None:
             lr_sched = self.lr_sched_cls(optzr, **self.lr_sched_args)
         else:
@@ -134,6 +185,9 @@ class TorchEstimator(BaseEstimator):
         )
 
         for _ in range(self.train_epochs):
+            mean_ep_loss = 0
+            epoch_pbar = trange(len(train_loader), desc=f"Epoch {ep}", disable=not log)
+
             if lr_sched is not None:
                 lr_sched.step()
 
@@ -147,30 +201,51 @@ class TorchEstimator(BaseEstimator):
                 loss.backward()
                 optzr.step()
 
+                # update loss on tensor progress bar
+                loss = loss.item()
+                mean_ep_loss += loss / len(train_loader)
+                epoch_pbar.set_postfix(loss=loss)
+                epoch_pbar.update(1)
+            # training acc on all training data for current epoch
+            if log and tb_writer is not None:
+                y_pred = self.predict(X, acquire_device=False)
+                y_pred = y_pred.argmax(axis=1)
+                train_acc = accuracy_score(y, y_pred)
+                tb_writer.add_scalar(f"loss", mean_ep_loss, ep)
+                tb_writer.add_scalar(f"train_acc", train_acc, ep)
+
+            epoch_pbar.close()
+
+            # saving model
+        if log:
+            print("Saving model")
+            model_path = self.model_path / f"{self.model_id}.pth"
+            torch.save(self.model.state_dict(), model_path)
+
         TorchDeviceManager.release_device(self.device)
 
-    def predict(self, X):
+    def predict(self, X, acquire_device=True):
         if self.model is None:
             raise RuntimeError("model not trained")
 
         test_dataset = _ArrayDataset(X)
-        test_loader = DataLoader(
-            test_dataset, self.test_batch_size, pin_memory=True
-        )
+        test_loader = DataLoader(test_dataset, self.test_batch_size, pin_memory=True)
         yhat = []
 
-        TorchDeviceManager.acquire_device(self.device)
+        if acquire_device:
+            TorchDeviceManager.acquire_device(self.device)
         for X_batch in iter(test_loader):
             X_batch = X_batch[0].to(self.device)
             yhat_batch = self.model(X_batch)
             yhat.append(yhat_batch.detach().cpu().numpy())
-        TorchDeviceManager.release_device(self.device)
+        if acquire_device:
+            TorchDeviceManager.release_device(self.device)
 
         yhat = np.vstack(yhat)
         return yhat
 
 
-class FCNet(nn.Module):
+class FCNet2(nn.Module):
     def __init__(self, h_dim):
         super().__init__()
         self.fc1 = nn.Linear(8, h_dim)
@@ -203,67 +278,21 @@ class CNNet(nn.Module):
         return x
 
 
-def main():
-    if torch.cuda.is_available():
-        TorchDeviceManager.init_cuda()
+class FCNet(nn.Module):
+    def __init__(self, n_channels, n_output, layer_sizes, nonlin=F.relu):
+        super().__init__()
+        layer_sizes = [n_channels] + layer_sizes + [n_output]
+        self.layers = []
+        for i, (l, lnext) in enumerate(zip(layer_sizes[:-1], layer_sizes[1:])):
+            fc = nn.Linear(l, lnext)
+            self.layers.append(fc)
+            setattr(self, f"fc{i}", fc)
+        self.nonlin = nonlin
 
-    # Regression
-    base_model = TorchEstimator(FCNet)
-    param_grid = dict(
-        model_args=[dict(h_dim=4), dict(h_dim=8), dict(h_dim=16)],
-        lr=[0.1, 0.01, 0.001],
-        train_epochs=[1, 5, 10],
-    )
-    model_grid = GridSearchCV(
-        base_model,
-        param_grid,
-        scoring="neg_mean_squared_error",
-        iid=True,
-        cv=5,
-        refit=True,
-        error_score="raise",
-    )
-
-    X = np.random.randn(100, 8).astype(np.float32)
-    y = np.random.randn(100).astype(np.float32)
-
-    cv_score = cross_validate(
-        model_grid,
-        X,
-        y,
-        scoring="neg_mean_squared_error",
-        cv=3,
-        n_jobs=4,
-        verbose=True,
-        error_score="raise",
-    )
-    print(cv_score)
-
-    # Classification
-    def _clf_score_wrapper(score_fun):
-        @wraps(score_fun)
-        def _wrapper(y_true, y_pred, *args, **kwargs):
-            y_pred = y_pred.argmax(axis=1)
-            return score_fun(y_true, y_pred, *args, **kwargs)
-
-        return _wrapper
-
-    score_fun = make_scorer(_clf_score_wrapper(accuracy_score))
-
-    base_model = TorchEstimator(CNNet, loss_fun=F.cross_entropy)
-    param_grid = dict(lr=[0.1, 0.01, 0.001], train_epochs=[1, 5, 10])
-    model_grid = GridSearchCV(
-        base_model, param_grid, scoring=score_fun, iid=True, cv=5, refit=True
-    )
-
-    X = np.random.rand(100, 3, 28, 28).astype(np.float32)
-    y = np.random.randint(0, 10, 100)
-
-    cv_score = cross_validate(
-        model_grid, X, y, scoring=score_fun, cv=3, n_jobs=4, verbose=True
-    )
-    print(cv_score)
-
-
-if __name__ == "__main__":
-    main()
+    def forward(self, x):
+        for i in range(len(self.layers) - 1):
+            layer = self.layers[i]
+            x = self.nonlin(layer(x))
+        last_layer = self.layers[-1]
+        x = last_layer(x)
+        return x
