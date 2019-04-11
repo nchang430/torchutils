@@ -128,16 +128,14 @@ class MultiRidge:
             X_te = X_te / self.Xs
         M_te = X_te @ self.Q
 
-        scores = torch.zeros(
-            Y_te.shape[1], len(self.ls), dtype=X_te.dtype, device=X_te.device
-        )
+        scores = torch.zeros(Y_te.shape[1], len(self.ls), dtype=X_te.dtype)
         for j, Y_te_j in enumerate(Y_te.t()):
             N_te_j = None
             for k, l in enumerate(self.ls):
                 Yhat_te_j, N_te_j = self._predict_single(
                     X_te, M_te, j, l, N_te_j
                 )
-                scores[j, k] = scoring(Y_te_j, Yhat_te_j)
+                scores[j, k] = scoring(Y_te_j, Yhat_te_j).item()
         return scores
 
     def predict_single(self, X_te, l_idxs):
