@@ -33,9 +33,13 @@ class LogGridSearchCV(GridSearchCV):
 
         self.best_index_ = results["rank_test_%s" % refit_metric].argmin()
         self.best_params_ = results["params"][self.best_index_]
-        self.best_score_ = results["mean_test_%s" % refit_metric][self.best_index_]
+        self.best_score_ = results["mean_test_%s" % refit_metric][
+            self.best_index_
+        ]
 
-        self.best_estimator_ = clone(self.estimator).set_params(**self.best_params_)
+        self.best_estimator_ = clone(self.estimator).set_params(
+            **self.best_params_
+        )
         refit_start_time = time.time()
         if y is not None:
             self.best_estimator_.fit(X, y, log=True, **fit_params)
@@ -147,7 +151,9 @@ class TorchEstimator(BaseEstimator):
             try:
                 tb_dir = path.Path(self.tb_dir) / self.model_id
                 tb_dir.mkdir()
-                tb_writer = SummaryWriter(str(tb_dir), purge_step=0, max_queue=0)
+                tb_writer = SummaryWriter(
+                    str(tb_dir), purge_step=0, max_queue=0
+                )
                 log.debug(f"Tensorboard writer initialized for {self.tb_dir}")
                 repo = git.Repo(search_parent_directories=True)
                 sha = repo.head.object.hexsha
@@ -166,10 +172,12 @@ class TorchEstimator(BaseEstimator):
         if self.lr_sched_args is None:
             self.lr_sched_args = dict()
 
-        self.model = self.model_cls(**self.key_model_args, **self.model_args).to(
-            self.device
+        self.model = self.model_cls(
+            **self.key_model_args, **self.model_args
+        ).to(self.device)
+        optzr = self.optim_cls(
+            self.model.parameters(), self.lr, **self.optim_args
         )
-        optzr = self.optim_cls(self.model.parameters(), self.lr, **self.optim_args)
         if self.lr_sched_cls is not None:
             lr_sched = self.lr_sched_cls(optzr, **self.lr_sched_args)
         else:
@@ -186,7 +194,9 @@ class TorchEstimator(BaseEstimator):
 
         for _ in range(self.train_epochs):
             mean_ep_loss = 0
-            epoch_pbar = trange(len(train_loader), desc=f"Epoch {ep}", disable=not log)
+            epoch_pbar = trange(
+                len(train_loader), desc=f"Epoch {ep}", disable=not log
+            )
 
             if lr_sched is not None:
                 lr_sched.step()
@@ -229,7 +239,9 @@ class TorchEstimator(BaseEstimator):
             raise RuntimeError("model not trained")
 
         test_dataset = _ArrayDataset(X)
-        test_loader = DataLoader(test_dataset, self.test_batch_size, pin_memory=True)
+        test_loader = DataLoader(
+            test_dataset, self.test_batch_size, pin_memory=True
+        )
         yhat = []
 
         if acquire_device:
