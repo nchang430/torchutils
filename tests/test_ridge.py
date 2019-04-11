@@ -100,9 +100,9 @@ class TestMultiRidgeInterface(TestInterfaceBase):
     def setUp(self):
         super().setUp()
         self.multi_ridge = MultiRidge(self.LS)
-        self.multi_ridge.fit(self.X_tr, self.Y_tr)
 
     def test_get_prediction_scores_return_value(self):
+        self.multi_ridge.fit(self.X_tr, self.Y_tr)
         scores = self.multi_ridge.get_prediction_scores(
             self.X_te, self.Y_te, MSE_SCORING
         )
@@ -111,6 +111,7 @@ class TestMultiRidgeInterface(TestInterfaceBase):
         self.assertListEqual(list(scores.shape), [self.N_TARGETS, len(self.LS)])
 
     def test_predict_single_return_value(self):
+        self.multi_ridge.fit(self.X_tr, self.Y_tr)
         Yhat_te = self.multi_ridge.predict_single(
             self.X_te, [0] * self.N_TARGETS
         )
@@ -139,14 +140,14 @@ class TestMultiRidgeFunction(TestFunctionBase):
     def _fit_predict(self, ridge_mr, ridge_sk, scale):
         ridge_mr.fit(self.X_tr, self.Y_tr)
 
-        X_tr_np, X_te_np = self.X_tr.numpy(), self.X_te.numpy()
-        X_tr_np = X_tr_np - ridge_mr.Xm.numpy()
-        X_te_np = X_te_np - ridge_mr.Xm.numpy()
+        X_tr_np, X_te_np = self.X_tr.cpu().numpy(), self.X_te.cpu().numpy()
+        X_tr_np = X_tr_np - ridge_mr.Xm.cpu().numpy()
+        X_te_np = X_te_np - ridge_mr.Xm.cpu().numpy()
         if scale:
-            X_tr_np = X_tr_np / ridge_mr.Xs.numpy()
-            X_te_np = X_te_np / ridge_mr.Xs.numpy()
+            X_tr_np = X_tr_np / ridge_mr.Xs.cpu().numpy()
+            X_te_np = X_te_np / ridge_mr.Xs.cpu().numpy()
 
-        ridge_sk.fit(X_tr_np, self.Y_tr.numpy())
+        ridge_sk.fit(X_tr_np, self.Y_tr.cpu().numpy())
 
         Yhat_te_mr = ridge_mr.predict_single(self.X_te, [0] * self.N_TARGETS)
         Yhat_te_sk = ridge_sk.predict(X_te_np)
@@ -172,12 +173,14 @@ class TestMultiRidgeFunction(TestFunctionBase):
             self.X_te, self.Y_te, MSE_SCORING
         )
         for i, l in enumerate(self.LS):
-            ridge_sk = Ridge(l).fit(self.X_tr.numpy(), self.Y_tr.numpy())
-            Yhat_te_sk = ridge_sk.predict(self.X_te.numpy())
+            ridge_sk = Ridge(l).fit(
+                self.X_tr.cpu().numpy(), self.Y_tr.cpu().numpy()
+            )
+            Yhat_te_sk = ridge_sk.predict(self.X_te.cpu().numpy())
             for j, yhat_te_sk_j in enumerate(Yhat_te_sk.T):
                 score_ij_mr = scores_mr[j, i].item()
                 score_ij_sk = -1 * mean_squared_error(
-                    self.Y_te[:, j].numpy(), yhat_te_sk_j
+                    self.Y_te[:, j].cpu().numpy(), yhat_te_sk_j
                 )
                 self.assertAlmostEqual(score_ij_mr, score_ij_sk, delta=1e-1)
 
@@ -207,7 +210,7 @@ class TestRidgeCVEstimatorInterface(TestInterfaceBase):
         with self.assertRaises(AttributeError):
             RidgeCVEstimator(self.LS.unsqueeze(0), self.CV, MSE_SCORING)
         with self.assertRaises(AttributeError):
-            RidgeCVEstimator(self.LS.numpy(), self.CV, MSE_SCORING)
+            RidgeCVEstimator(self.LS.cpu().numpy(), self.CV, MSE_SCORING)
         with self.assertRaises(AttributeError):
             RidgeCVEstimator(self.LS.int(), self.CV, MSE_SCORING)
 
@@ -265,9 +268,9 @@ class TestRidgeCVEstimatorFunction(TestFunctionBase):
     def _fit_predict(self, ridge_cve, ridge_sk, single=False):
         Y_tr = self.Y_tr[:, :1] if single else self.Y_tr
         ridge_cve.fit(self.X_tr, Y_tr)
-        ridge_sk.fit(self.X_tr.numpy(), Y_tr.numpy())
+        ridge_sk.fit(self.X_tr.cpu().numpy(), Y_tr.cpu().numpy())
         Yhat_te_cve = ridge_cve.predict(self.X_te)
-        Yhat_te_sk = ridge_sk.predict(self.X_te.numpy())
+        Yhat_te_sk = ridge_sk.predict(self.X_te.cpu().numpy())
         return Yhat_te_cve, torch.from_numpy(Yhat_te_sk)
 
     def test_single_target_kfold(self):
