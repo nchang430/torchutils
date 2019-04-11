@@ -6,7 +6,7 @@ import unittest
 from sklearn.datasets import load_linnerud
 from sklearn.linear_model import Ridge, RidgeCV
 from sklearn.metrics import mean_squared_error
-from sklearn.model_selection import KFold
+from sklearn.model_selection import GroupKFold, KFold
 import torch
 import torch.nn.functional as F
 
@@ -263,25 +263,19 @@ class TestRidgeCVEstimatorFunction(TestFunctionBase):
 
     """Test RidgeCVEstimator by comparing with sklearn."""
 
-    KFOLD = KFold(5)
-
-    def _fit_predict(self, ridge_cve, ridge_sk, single=False):
+    def _fit_predict(self, ridge_cve, ridge_sk, groups=None, single=False):
         Y_tr = self.Y_tr[:, :1] if single else self.Y_tr
-        ridge_cve.fit(self.X_tr, Y_tr)
+        ridge_cve.fit(self.X_tr, Y_tr, groups)
         ridge_sk.fit(self.X_tr.cpu().numpy(), Y_tr.cpu().numpy())
         Yhat_te_cve = ridge_cve.predict(self.X_te)
         Yhat_te_sk = ridge_sk.predict(self.X_te.cpu().numpy())
         return Yhat_te_cve, torch.from_numpy(Yhat_te_sk)
 
     def test_single_target_kfold(self):
-        ridge_cve = RidgeCVEstimator(
-            self.LS, self.KFOLD, MSE_SCORING, scale_X=False
-        )
+        cv = KFold(5)
+        ridge_cve = RidgeCVEstimator(self.LS, cv, MSE_SCORING, scale_X=False)
         ridge_sk = RidgeCV(
-            self.LS,
-            cv=self.KFOLD,
-            scoring="neg_mean_squared_error",
-            gcv_mode="svd",
+            self.LS, cv=cv, scoring="neg_mean_squared_error", gcv_mode="svd"
         )
 
         Yhat_te_cve, Yhat_te_sk = self._fit_predict(
@@ -294,16 +288,34 @@ class TestRidgeCVEstimatorFunction(TestFunctionBase):
             places=self.ASSERT_PLACES,
         )
 
+    def test_single_target_grouped_kfold(self):
+        cv = GroupKFold(4)
+        groups = [0] * 3 + [1] * 4 + [2] * 2 + [3] * 6
+        ridge_cve = RidgeCVEstimator(self.LS, cv, MSE_SCORING, scale_X=False)
+        ridge_sk = RidgeCV(
+            self.LS,
+            cv=list(cv.split(self.X_tr, groups=groups)),
+            scoring="neg_mean_squared_error",
+            gcv_mode="svd",
+        )
+        Yhat_te_cve, Yhat_te_sk = self._fit_predict(
+            ridge_cve, ridge_sk, groups, single=True
+        )
+        self._compare_preds(Yhat_te_cve, Yhat_te_sk)
+        self.assertAlmostEqual(
+            self.LS[ridge_cve.best_l_idxs[0]].item(),
+            ridge_sk.alpha_,
+            places=self.ASSERT_PLACES,
+        )
+
     def test_single_l_kfold(self):
+        cv = KFold(5)
         for l in self.LS:
             ridge_cve = RidgeCVEstimator(
-                torch.tensor([l]), self.KFOLD, MSE_SCORING, scale_X=False
+                torch.tensor([l]), cv, MSE_SCORING, scale_X=False
             )
             ridge_sk = RidgeCV(
-                [l],
-                cv=self.KFOLD,
-                scoring="neg_mean_squared_error",
-                gcv_mode="svd",
+                [l], cv=cv, scoring="neg_mean_squared_error", gcv_mode="svd"
             )
             Yhat_te_cve, Yhat_te_sk = self._fit_predict(ridge_cve, ridge_sk)
             self._compare_preds(Yhat_te_cve, Yhat_te_sk)
